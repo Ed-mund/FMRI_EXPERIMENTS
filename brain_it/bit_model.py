@@ -151,12 +151,15 @@ class BrainTokenizer(nn.Module):
         cluster_assignments: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Sparse graph attention: each cluster attends only to its assigned voxels.
+        Vectorized sparse graph attention: each cluster attends only to its assigned voxels.
+
+        Replaces the original per-cluster Python loop with a single batched einsum +
+        masked softmax over all clusters simultaneously.
 
         Args:
             modulated:           (B, N_v, D)
             cluster_emb:         (n_clusters, D)
-            cluster_assignments: (N_v,) int, cluster index per voxel
+            cluster_assignments: (N_v,) int, cluster index per voxel in [0, n_clusters)
 
         Returns:
             (B, n_clusters, D)
@@ -165,39 +168,26 @@ class BrainTokenizer(nn.Module):
         n_clusters = self.n_clusters
         device = modulated.device
 
-        # We implement this efficiently using scatter/gather:
-        # Build output tensor, compute per-cluster attention pooling
-        output = torch.zeros(B, n_clusters, D, device=device, dtype=modulated.dtype)
+        K = self.k_proj(modulated)   # (B, N_v, D)
+        V = self.v_proj(modulated)   # (B, N_v, D)
+        Q = self.q_proj(cluster_emb) # (n_clusters, D)
 
-        # Precompute K, V projections for all voxels
-        K = self.k_proj(modulated)  # (B, N_v, D)
-        V = self.v_proj(modulated)  # (B, N_v, D)
-        Q = self.q_proj(cluster_emb)  # (n_clusters, D)
+        # scores[b, c, n] = Q[c] · K[b, n] / scale  →  (B, n_clusters, N_v)
+        scores = torch.einsum("cd,bnd->bcn", Q, K) / self.scale
 
-        # For each cluster, scatter-gather attention
-        # Use segment_softmax approach: for each cluster c,
-        #   attn_weights_c = softmax(Q[c] · K[:, voxels_in_c, :] / scale)  (B, n_c)
-        #   output[:, c, :] = attn_weights_c @ V[:, voxels_in_c, :]
+        # membership[c, n] = True if voxel n belongs to cluster c  →  (n_clusters, N_v)
+        cluster_ids = torch.arange(n_clusters, device=device).unsqueeze(1)  # (n_clusters, 1)
+        membership = cluster_assignments.unsqueeze(0) == cluster_ids         # (n_clusters, N_v)
 
-        for c in range(n_clusters):
-            mask = (cluster_assignments == c)  # (N_v,)
-            n_c = mask.sum().item()
-            if n_c == 0:
-                # Empty cluster: use zero token
-                continue
+        # Mask non-member voxels with -inf before softmax
+        scores = scores.masked_fill(~membership.unsqueeze(0), float("-inf"))
 
-            K_c = K[:, mask, :]  # (B, n_c, D)
-            V_c = V[:, mask, :]  # (B, n_c, D)
-            q_c = Q[c]           # (D,)
+        # Softmax over voxel dim; empty clusters produce NaN → replace with 0
+        attn = F.softmax(scores, dim=-1).nan_to_num(0.0)  # (B, n_clusters, N_v)
+        attn = self.dropout(attn)
 
-            # Attention scores: (B, n_c)
-            scores = torch.einsum("d,bnd->bn", q_c, K_c) / self.scale
-            attn = F.softmax(scores, dim=-1)  # (B, n_c)
-            attn = self.dropout(attn)
-
-            # Weighted sum: (B, D)
-            out_c = torch.einsum("bn,bnd->bd", attn, V_c)
-            output[:, c, :] = out_c
+        # Weighted aggregation: (B, n_clusters, D)
+        output = torch.einsum("bcn,bnd->bcd", attn, V)
 
         return output
 

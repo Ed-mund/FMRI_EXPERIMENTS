@@ -217,8 +217,8 @@ class DIPInverter:
         from vgg_features import vgg_maps_to_tokens, preprocess_for_vgg
         from vgg_features import VGGFeatureExtractor
 
-        # Target feature maps (detached from computational graph)
-        target_maps = self._predicted_tokens_to_maps(predicted_tokens)
+        # Detach predicted tokens from any computational graph (targets are fixed)
+        predicted_tokens = [t.detach() for t in predicted_tokens]
 
         # Build a fresh DIP model for this inversion
         dip = UNetDIP(in_ch=32, hidden=128, n_scales=3).to(self.device)
@@ -242,15 +242,28 @@ class DIPInverter:
             # Generate image
             img = dip(z_noisy)  # (1, 3, H, W) in [0, 1]
 
-            # Extract VGG features from generated image
+            # Extract VGG features from generated image and convert to tokens.
+            # We call the VGG backbone layers DIRECTLY (bypassing the @no_grad
+            # decorator on VGGFeatureExtractor.forward) so that activations stay
+            # in the autograd graph and gradients can flow back to the DIP network.
             img_vgg = preprocess_for_vgg(img, size=self.image_size)
-            feat_maps = self.vgg(img_vgg) if isinstance(self.vgg, VGGFeatureExtractor) else self.vgg.vgg(img_vgg)
+            vgg_backbone = self.vgg if isinstance(self.vgg, VGGFeatureExtractor) else self.vgg.vgg
+            feat_maps = []
+            x_vgg = img_vgg
+            for i, layer in enumerate(vgg_backbone.features):
+                x_vgg = layer(x_vgg)
+                if i in set(vgg_backbone._extract_at):
+                    feat_maps.append(x_vgg)
+            gen_tokens = vgg_maps_to_tokens(feat_maps)
 
-            # L2 loss against target feature maps (equal weight per layer)
+            # L2 loss against predicted tokens (equal weight per layer).
+            # gen_tokens are 512-dim (replicated); predicted_tokens have raw
+            # layer channel dims (64,128,256,512,512), matching the training
+            # convention where targets are sliced to min(D_pred, D_tgt).
             loss = sum(
-                F.mse_loss(gen_feat, tgt_feat)
-                for gen_feat, tgt_feat in zip(feat_maps, target_maps)
-            ) / len(feat_maps)
+                F.mse_loss(gen_tok[..., :tgt_tok.shape[-1]], tgt_tok)
+                for gen_tok, tgt_tok in zip(gen_tokens, predicted_tokens)
+            ) / len(gen_tokens)
 
             loss.backward()
             optimizer.step()

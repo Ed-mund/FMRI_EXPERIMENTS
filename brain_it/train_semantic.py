@@ -34,7 +34,9 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import os
+import re
 import signal
 import sys
 import time
@@ -384,59 +386,149 @@ def validate_stage1(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: Joint training with MindEye2 diffusion model
+# Stage 2: Joint training with MindEye2 unCLIP diffusion model
 # ---------------------------------------------------------------------------
 
-def _load_mindeye2_pipeline(checkpoint_dir: str, device: torch.device):
-    """
-    Load MindEye2's unCLIP SDXL diffusion pipeline.
-    The pipeline conditions on 256 OpenCLIP ViT-bigG/14 spatial tokens.
+UNCLIP_NUM_TIMESTEPS = 1000
+UNCLIP_BETA_START = 0.00085
+UNCLIP_BETA_END = 0.012
 
-    MindEye2 weights are available at: huggingface.co/datasets/pscotti/mindeyev2
-    The relevant component is the 'versatile_diffusion' prior that accepts
-    clip_image_embeds of shape (B, 256, 1280).
+
+def _make_ddpm_alphas(device: torch.device):
+    """Pre-compute sqrt(alpha_bar) schedule for DDPM (LegacyDDPMDiscretization)."""
+    betas = torch.linspace(
+        UNCLIP_BETA_START ** 0.5, UNCLIP_BETA_END ** 0.5,
+        UNCLIP_NUM_TIMESTEPS, dtype=torch.float64,
+    ) ** 2
+    alphas = 1.0 - betas
+    alpha_bar = torch.cumprod(alphas, dim=0).float().to(device)
+    return torch.sqrt(alpha_bar), torch.sqrt(1.0 - alpha_bar)
+
+
+class CLIPProjection(nn.Module):
+    """Learned projection from SemanticBIT (1280-dim) to unCLIP cross-attn (1664-dim)."""
+    def __init__(self, in_dim: int = 1280, out_dim: int = 1664):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+def _load_unclip_components(checkpoint_dir: str, device: torch.device):
     """
+    Load MindEye2 unCLIP SDXL components via Stability-AI's sgm framework.
+
+    Builds the UNet (context_dim=1664) and VAE from the unclip6 config,
+    then loads pre-trained weights.  The 1.9B-param CLIP image embedder
+    is *not* loaded — only the lightweight timestep embedders are used to
+    compute the fixed vector conditioning suffix.
+
+    Returns: (unet, vae, vector_suffix, scale_factor)
+    """
+    sgm_path = os.environ.get(
+        "SGM_PATH",
+        str(Path(__file__).resolve().parent.parent / "generative-models"),
+    )
+    if sgm_path not in sys.path:
+        sys.path.insert(0, sgm_path)
+
+    from omegaconf import OmegaConf
+    from sgm.util import instantiate_from_config
+    from sgm.modules.diffusionmodules.util import timestep_embedding
+
+    config_path = Path(__file__).parent / "configs" / "unclip6.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"unCLIP config not found: {config_path}")
+
+    cfg = OmegaConf.load(str(config_path))
+    cfg = OmegaConf.to_container(cfg, resolve=True)
+    params = cfg["model"]["params"]
+    scale_factor = params["scale_factor"]
+
     try:
-        from diffusers import StableDiffusionXLPipeline, UnCLIPImageVariationPipeline
-        from diffusers import DDIMScheduler
+        import xformers  # noqa: F401
     except ImportError:
-        raise ImportError(
-            "diffusers is required for stage 2. Install with: pip install diffusers accelerate"
-        )
+        log.info("xformers not available (no aarch64 wheel) — using vanilla attention")
+        params["network_config"]["params"]["spatial_transformer_attn_type"] = "softmax"
+        params["first_stage_config"]["params"]["ddconfig"]["attn_type"] = "vanilla"
 
-    ckpt_path = Path(checkpoint_dir)
+    # Suppress the noisy "no module xformers" / SpatialTransformer context_dim
+    # warnings emitted by the SGM library on every forward pass; these are
+    # expected on aarch64 where no xformers wheel exists.
+    import logging as _logging
+    _logging.getLogger("sgm").setLevel(_logging.ERROR)
+    _logging.getLogger("pytorch_lightning").setLevel(_logging.ERROR)
+    log.info("Building unCLIP UNet (context_dim=1664)...")
+    unet = instantiate_from_config(params["network_config"])
+
+    log.info("Building VAE...")
+    vae_cfg = dict(params["first_stage_config"])
+    vae_cfg["target"] = "sgm.models.autoencoder.AutoencoderKL"
+    vae = instantiate_from_config(vae_cfg)
+
+    ckpt_path = Path(checkpoint_dir) / "unclip6_epoch0_step110000.ckpt"
     if not ckpt_path.exists():
         raise FileNotFoundError(
-            f"MindEye2 checkpoint not found at {checkpoint_dir}.\n"
-            "Download from: https://huggingface.co/datasets/pscotti/mindeyev2\n"
-            "Or use the MindEye2 repo's download script."
+            f"unCLIP checkpoint not found: {ckpt_path}\n"
+            "Download from: https://huggingface.co/datasets/pscotti/mindeyev2"
         )
+    log.info("Loading unCLIP checkpoint (may take a minute): %s", ckpt_path)
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    sd = ckpt["state_dict"]
+    del ckpt
 
-    # Load the unCLIP-style SDXL pipeline used in MindEye2
-    # This accepts 256 spatial CLIP tokens as conditioning
-    try:
-        from diffusers import DiffusionPipeline
-        pipe = DiffusionPipeline.from_pretrained(
-            checkpoint_dir,
-            torch_dtype=torch.bfloat16,
-            safety_checker=None,
-        )
-        pipe.to(device)
-        pipe.enable_attention_slicing()
-        unet = pipe.unet
-        vae = pipe.vae
-        noise_scheduler = pipe.scheduler
-        return pipe, unet, vae, noise_scheduler
-    except Exception as e:
-        log.error("Failed to load MindEye2 pipeline: %s", e)
-        raise
+    # Lightning / sgm checkpoints may store UNet weights as either
+    # ``model.<param>`` (legacy) or ``model.diffusion_model.<param>`` (nested).
+    if any(k.startswith("model.diffusion_model.") for k in sd):
+        unet_sd = {
+            k[len("model.diffusion_model."):]: v
+            for k, v in sd.items()
+            if k.startswith("model.diffusion_model.")
+        }
+    else:
+        unet_sd = {
+            k[len("model."):]: v
+            for k, v in sd.items()
+            if k.startswith("model.") and not k.startswith("model_ema")
+        }
+    unet.load_state_dict(unet_sd, strict=True)
+    log.info("  UNet loaded (%d params)", sum(p.numel() for p in unet.parameters()))
+
+    vae_sd = {
+        k[len("first_stage_model."):]: v for k, v in sd.items()
+        if k.startswith("first_stage_model.")
+    }
+    vae.load_state_dict(vae_sd, strict=True)
+    log.info("  VAE loaded (%d params)", sum(p.numel() for p in vae.parameters()))
+    del sd
+
+    with torch.no_grad():
+        def _embed_scalars(values, dim):
+            return torch.cat(
+                [timestep_embedding(torch.tensor([v]), dim) for v in values],
+                dim=-1,
+            )
+        size_vec = _embed_scalars([768.0, 768.0], 256)
+        crop_vec = _embed_scalars([0.0, 0.0], 256)
+        vector_suffix = torch.cat([size_vec, crop_vec], dim=-1)  # (1, 1024)
+
+    unet.to(device)
+    vae.to(device)
+    vector_suffix = vector_suffix.to(device)
+
+    return unet, vae, vector_suffix, scale_factor
 
 
 def train_stage2_epoch(
     bit_model: SemanticBIT,
+    clip_proj: CLIPProjection,
     unet,
     vae,
-    noise_scheduler,
+    sqrt_alpha_bar: torch.Tensor,
+    sqrt_one_minus_alpha_bar: torch.Tensor,
+    vector_suffix: torch.Tensor,
+    scale_factor: float,
     loader,
     optimizer,
     scaler,
@@ -444,12 +536,17 @@ def train_stage2_epoch(
     epoch: int,
     global_step: int,
     args: argparse.Namespace,
-) -> tuple[float, dict, int]:
+) -> tuple[float, dict, int, bool]:
     """
-    Joint training: SemanticBIT + diffusion UNet.
-    Returns (avg_loss, extra_metrics, global_step).
+    Joint training: SemanticBIT + CLIPProjection + UNet cross-attention.
+
+    SemanticBIT predicts (B, 256, 1280) CLIP tokens, which are projected
+    to (B, 256, 1664) via CLIPProjection before being passed as the
+    cross-attention context to the sgm UNet.  The UNet also receives a
+    fixed (B, 1024) vector conditioning (image-size / crop-coord encoding).
     """
     bit_model.train()
+    clip_proj.train()
     unet.train()
     vae.eval()
     for p in vae.parameters():
@@ -462,9 +559,8 @@ def train_stage2_epoch(
     grad_accum_steps = args.grad_accum_steps
     use_wandb = args.wandb and _WANDB_AVAILABLE
 
-    # Timestep-range loss accumulators (early/mid/late denoising phases)
-    T = noise_scheduler.config.num_train_timesteps
-    range_loss = {"early": [], "mid": [], "late": []}  # late=noisy, early=clean
+    T = UNCLIP_NUM_TIMESTEPS
+    range_loss = {"early": [], "mid": [], "late": []}
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -494,33 +590,36 @@ def train_stage2_epoch(
 
             with autocast("cuda", dtype=torch.bfloat16, enabled=args.use_amp):
                 with torch.no_grad():
-                    latents = vae.encode(imgs_s * 2 - 1).latent_dist.sample()
-                    latents = latents * vae.config.scaling_factor
+                    latents = vae.encode(imgs_s * 2 - 1) * scale_factor
 
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(0, T, (B_s,), device=device).long()
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                a = sqrt_alpha_bar[timesteps, None, None, None]
+                b = sqrt_one_minus_alpha_bar[timesteps, None, None, None]
+                noisy_latents = a * latents + b * noise
 
                 clip_tokens = bit_model(fmri_s, vox_s, clust_s, subj)
+                context = clip_proj(clip_tokens)  # (B, 256, 1664)
+                y = vector_suffix.expand(B_s, -1)  # (B, 1024)
+
                 noise_pred = unet(
                     noisy_latents, timesteps,
-                    encoder_hidden_states=clip_tokens,
-                ).sample
+                    context=context, y=y,
+                )
                 loss = F.mse_loss(noise_pred.float(), noise.float())
 
-            # Track per-timestep-range loss (for W&B)
             with torch.no_grad():
                 for i, t in enumerate(timesteps):
                     tv = t.item()
-                    per_item_loss = F.mse_loss(
+                    per_item = F.mse_loss(
                         noise_pred[i:i+1].float(), noise[i:i+1].float()
                     ).item()
                     if tv < T // 3:
-                        range_loss["early"].append(per_item_loss)
+                        range_loss["early"].append(per_item)
                     elif tv < 2 * T // 3:
-                        range_loss["mid"].append(per_item_loss)
+                        range_loss["mid"].append(per_item)
                     else:
-                        range_loss["late"].append(per_item_loss)
+                        range_loss["late"].append(per_item)
 
             loss_scaled = loss / grad_accum_steps
             if args.use_amp:
@@ -531,23 +630,22 @@ def train_stage2_epoch(
             batch_loss = batch_loss + loss.detach()
             n_subj += 1
 
-        # Optimizer step after accumulation
         if (batch_idx + 1) % grad_accum_steps == 0:
             if args.use_amp:
                 scaler.unscale_(optimizer)
-                gnorm_bit = _grad_norm(bit_model, "bit_")
-                gnorm_unet = _grad_norm(unet, "unet_")
-                nn.utils.clip_grad_norm_(
-                    list(bit_model.parameters()) + list(unet.parameters()), max_norm=1.0,
-                )
+            trainable = [p for p in (
+                list(bit_model.parameters())
+                + list(clip_proj.parameters())
+                + list(unet.parameters())
+            ) if p.requires_grad]
+            gnorm_bit = _grad_norm(bit_model, "bit_")
+            gnorm_proj = _grad_norm(clip_proj, "proj_")
+            gnorm_unet = _grad_norm(unet, "unet_")
+            nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            if args.use_amp:
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                gnorm_bit = _grad_norm(bit_model, "bit_")
-                gnorm_unet = _grad_norm(unet, "unet_")
-                nn.utils.clip_grad_norm_(
-                    list(bit_model.parameters()) + list(unet.parameters()), max_norm=1.0,
-                )
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
@@ -556,10 +654,27 @@ def train_stage2_epoch(
                 _wandb_log({
                     "train/loss_step": batch_loss.item() / max(1, n_subj),
                     "train/lr": optimizer.param_groups[0]["lr"],
-                    **gnorm_bit,
-                    **gnorm_unet,
+                    **gnorm_bit, **gnorm_proj, **gnorm_unet,
                     **_gpu_stats(device),
                 }, step=global_step, use_wandb=use_wandb)
+
+            # Check for SLURM pre-emption signal after every optimizer step
+            if _SAVE_AND_EXIT:
+                log.info(
+                    "  SLURM signal: early exit at epoch %d batch %d/%d",
+                    epoch, batch_idx, n_batches,
+                )
+                avg_loss = (batch_loss / max(1, n_subj)).item()
+                total_loss += avg_loss
+                images_seen += len(images)
+                elapsed = time.time() - t0
+                extra = {
+                    "throughput_imgs_per_sec": images_seen / max(1e-3, elapsed),
+                    "diffusion_loss_early_t": float(np.mean(range_loss["early"])) if range_loss["early"] else 0.0,
+                    "diffusion_loss_mid_t": float(np.mean(range_loss["mid"])) if range_loss["mid"] else 0.0,
+                    "diffusion_loss_late_t": float(np.mean(range_loss["late"])) if range_loss["late"] else 0.0,
+                }
+                return total_loss / max(1, max(batch_idx, 1)), extra, global_step, True
 
         avg_loss = (batch_loss / max(1, n_subj)).item()
         total_loss += avg_loss
@@ -576,7 +691,7 @@ def train_stage2_epoch(
         "diffusion_loss_mid_t": float(np.mean(range_loss["mid"])) if range_loss["mid"] else 0.0,
         "diffusion_loss_late_t": float(np.mean(range_loss["late"])) if range_loss["late"] else 0.0,
     }
-    return total_loss / max(1, n_batches), extra, global_step
+    return total_loss / max(1, n_batches), extra, global_step, False
 
 
 # ---------------------------------------------------------------------------
@@ -821,28 +936,89 @@ def main(args: argparse.Namespace):
 
     # ----- Stage 2: Joint training with diffusion -----
     elif args.stage == 2:
-        pipe, unet, vae, noise_scheduler = _load_mindeye2_pipeline(
-            args.mindeye2_checkpoint, device
+        unet, vae, vector_suffix, scale_factor = _load_unclip_components(
+            args.mindeye2_checkpoint, device,
         )
+        clip_proj = CLIPProjection(1280, 1664).to(device)
+        sqrt_alpha_bar, sqrt_one_minus_alpha_bar = _make_ddpm_alphas(device)
 
-        params_to_train = list(model.parameters()) + list(unet.parameters())
-        optimizer = torch.optim.AdamW(params_to_train, lr=args.lr, weight_decay=1e-4)
+        # Freeze most of UNet — only fine-tune cross-attention K and V
+        for p in unet.parameters():
+            p.requires_grad_(False)
+        _attn2_re = re.compile(
+            r"(input_blocks|middle_block|output_blocks)"
+            r".*transformer_blocks.*attn2\.(to_k|to_v)\.weight"
+        )
+        n_unfrozen = 0
+        for name, p in unet.named_parameters():
+            if _attn2_re.search(name):
+                p.requires_grad_(True)
+                n_unfrozen += 1
+        log.info("UNet cross-attention K,V: %d weight tensors unfrozen", n_unfrozen)
+
+        trainable_params = (
+            list(model.parameters())
+            + list(clip_proj.parameters())
+            + [p for p in unet.parameters() if p.requires_grad]
+        )
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
         scaler = _make_scaler() if args.use_amp else None
+
+        # Cosine LR schedule with linear warmup for stage 2
+        def _s2_lr_lambda(step: int) -> float:
+            warmup = args.s2_warmup_epochs
+            total = args.epochs
+            if step < warmup:
+                return (step + 1) / max(1, warmup)
+            progress = (step - warmup) / max(1, total - warmup)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _s2_lr_lambda)
 
         start_epoch, best_val, history = 0, float("inf"), []
         latest = out_dir / "checkpoint_latest.pt"
         if args.resume and latest.exists():
-            start_epoch, best_val, history = load_checkpoint(latest, model, optimizer, scaler, device)
+            ckpt = torch.load(str(latest), map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "clip_proj_state_dict" in ckpt:
+                clip_proj.load_state_dict(ckpt["clip_proj_state_dict"])
+            if "unet_finetuned" in ckpt:
+                unet.load_state_dict(ckpt["unet_finetuned"], strict=False)
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if scaler and ckpt.get("scaler_state_dict"):
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            start_epoch = ckpt["epoch"] + 1
+            best_val = ckpt.get("best_val_loss", float("inf"))
+            history = ckpt.get("history", [])
+            del ckpt
             global_step = start_epoch * (len(train_loader) // args.grad_accum_steps)
+            log.info("Resumed stage 2 from epoch %d", start_epoch)
+
+        if start_epoch >= args.epochs:
+            log.info("Stage 2 already complete (%d/%d epochs). Nothing to do.", start_epoch, args.epochs)
+            if args.wandb and _WANDB_AVAILABLE:
+                wandb.finish()
+            return
+
+        # Advance the LR scheduler to match the resumed epoch
+        for _ in range(start_epoch):
+            lr_scheduler.step()
 
         for epoch in range(start_epoch, args.epochs):
             t0 = time.time()
-            train_loss, train_extra, global_step = train_stage2_epoch(
-                model, unet, vae, noise_scheduler,
+            train_loss, train_extra, global_step, exit_early = train_stage2_epoch(
+                model, clip_proj, unet, vae,
+                sqrt_alpha_bar, sqrt_one_minus_alpha_bar,
+                vector_suffix, scale_factor,
                 train_loader, optimizer, scaler, device, epoch, global_step, args,
             )
+            lr_scheduler.step()
             epoch_time = time.time() - t0
             current_lr = optimizer.param_groups[0]["lr"]
+
+            if exit_early:
+                log.info("SLURM signal: exiting cleanly after partial epoch %d (checkpoint at epoch %d)",
+                         epoch, epoch - 1)
+                break
 
             log.info(
                 "Epoch %d/%d | diff_loss=%.4f (early=%.4f mid=%.4f late=%.4f) | %.0f img/s",
@@ -862,12 +1038,31 @@ def main(args: argparse.Namespace):
             }
             history.append(record)
 
+            # Save lightweight artefacts every epoch
             torch.save(model.state_dict(), out_dir / "bit_latest.pt")
-            torch.save(unet.state_dict(), out_dir / "unet_latest.pt")
+            torch.save(clip_proj.state_dict(), out_dir / "clip_proj_latest.pt")
+            unet_finetuned = {
+                k: v.cpu() for k, v in unet.state_dict().items()
+                if _attn2_re.search(k)
+            }
+            torch.save(unet_finetuned, out_dir / "unet_attn2_latest.pt")
 
             if (epoch + 1) % args.save_every == 0:
                 torch.save(model.state_dict(), out_dir / f"bit_epoch{epoch:03d}.pt")
-                torch.save(unet.state_dict(), out_dir / f"unet_epoch{epoch:03d}.pt")
+                torch.save(clip_proj.state_dict(), out_dir / f"clip_proj_epoch{epoch:03d}.pt")
+
+            # Full checkpoint for --resume
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "clip_proj_state_dict": clip_proj.state_dict(),
+                "unet_finetuned": unet_finetuned,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler else None,
+                "best_val_loss": best_val,
+                "history": history,
+                "args": vars(args),
+            }, out_dir / "checkpoint_latest.pt")
 
             with open(out_dir / "history.json", "w") as f:
                 json.dump(history, f, indent=2)
@@ -932,6 +1127,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--voxels_per_image", type=int, default=15_000)
     p.add_argument("--lr", type=float, default=5e-4,
                    help="5e-4 for stage 1, 1e-5 for stage 2")
+    p.add_argument("--s2_warmup_epochs", type=int, default=1,
+                   help="Stage 2 LR warmup epochs (before cosine decay kicks in)")
     p.add_argument("--warmup_epochs", type=int, default=15)
     p.add_argument("--plateau_patience", type=int, default=5)
     p.add_argument("--use_amp", action="store_true", default=True)
@@ -954,3 +1151,7 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+    # Exit 75 (EX_TEMPFAIL) signals the Slurm wrapper to resubmit.
+    # _SAVE_AND_EXIT is True only when SIGUSR1/SIGTERM was received (time-limited).
+    # Normal completion and already-complete paths leave it False (exit 0).
+    sys.exit(75 if _SAVE_AND_EXIT else 0)
