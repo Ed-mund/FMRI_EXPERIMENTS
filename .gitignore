@@ -1,0 +1,18 @@
+# Runtime/generated outputs
+.logs/
+wandb/
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+brain_it/reconstructions/
+brain_it/results/
+brain_it/v2c/*.pkl
+brain_it/v2c/*.pt
+brain_it/v2c/*.npy
+
+# Local caches
+.cache/
+triton_cache/
