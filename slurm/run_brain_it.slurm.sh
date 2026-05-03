@@ -67,7 +67,9 @@ eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV}"
 
 cd "${SLURM_SUBMIT_DIR}"
-export PYTHONPATH="${BRAIN_IT_DIR}:${PYTHONPATH:-}"
+SGM_DIR="${PROJECTDIR}/brain/generative-models"
+export SGM_PATH="${SGM_DIR}"
+export PYTHONPATH="${BRAIN_IT_DIR}:${SGM_DIR}:${PYTHONPATH:-}"
 
 # Cache dirs
 export HF_HOME="${PROJECTDIR}/.cache/hf"
@@ -100,13 +102,15 @@ print(f'CUDA OK: {d.name}  {d.total_memory/1024**3:.0f} GB  bf16={torch.cuda.is_
 # ---------------------------------------------------------------------------
 PHASE=""
 RESUME_FLAG=""
+AUTO_RESUBMIT=false
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --phase)    PHASE="$2";      shift 2 ;;
-        --resume)   RESUME_FLAG="--resume"; shift ;;
-        *)          EXTRA_ARGS+=("$1"); shift ;;
+        --phase)           PHASE="$2";      shift 2 ;;
+        --resume)          RESUME_FLAG="--resume"; shift ;;
+        --auto_resubmit)   AUTO_RESUBMIT=true; shift ;;
+        *)                 EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -157,16 +161,20 @@ run_v2c() {
 # ---------------------------------------------------------------------------
 run_lowlevel() {
     echo "=== Phase: Train LowLevelBIT ==="
-    mkdir -p "${LOWLEVEL_DIR}"
 
-    # Find most recent lowlevel dir if resuming
     if [[ -n "${RESUME_FLAG}" ]]; then
-        LATEST_LL=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_lowlevel_"* 2>/dev/null | head -1 || echo "")
+        LATEST_LL=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_lowlevel_"* 2>/dev/null \
+            | xargs -I{} sh -c 'ls "{}"/checkpoint_latest.pt 2>/dev/null | head -1' \
+            | head -1 | xargs dirname 2>/dev/null || echo "")
         if [[ -n "${LATEST_LL}" ]]; then
             LOWLEVEL_DIR="${LATEST_LL}"
             echo "Resuming from: ${LOWLEVEL_DIR}"
+        else
+            echo "No checkpoint found for resume — starting fresh in ${LOWLEVEL_DIR}"
         fi
     fi
+
+    mkdir -p "${LOWLEVEL_DIR}"
 
     # Optional COCO fMRI argument
     COCO_ARG=""
@@ -202,15 +210,21 @@ run_lowlevel() {
 # ---------------------------------------------------------------------------
 run_semantic1() {
     echo "=== Phase: Train SemanticBIT Stage 1 ==="
-    mkdir -p "${SEMANTIC1_DIR}"
 
     if [[ -n "${RESUME_FLAG}" ]]; then
-        LATEST_S1=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic1_"* 2>/dev/null | head -1 || echo "")
+        # Find latest dir that actually contains a checkpoint (exclude empty new dirs)
+        LATEST_S1=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic1_"* 2>/dev/null \
+            | xargs -I{} sh -c 'ls "{}"/checkpoint_latest.pt 2>/dev/null | head -1' \
+            | head -1 | xargs dirname 2>/dev/null || echo "")
         if [[ -n "${LATEST_S1}" ]]; then
             SEMANTIC1_DIR="${LATEST_S1}"
             echo "Resuming from: ${SEMANTIC1_DIR}"
+        else
+            echo "No checkpoint found for resume — starting fresh in ${SEMANTIC1_DIR}"
         fi
     fi
+
+    mkdir -p "${SEMANTIC1_DIR}"
 
     COCO_ARG=""
     if [[ -d "${COCO_FMRI_DIR}" ]]; then
@@ -245,7 +259,6 @@ run_semantic1() {
 # ---------------------------------------------------------------------------
 run_semantic2() {
     echo "=== Phase: Train SemanticBIT Stage 2 ==="
-    mkdir -p "${SEMANTIC2_DIR}"
 
     # Find stage 1 best model
     S1_CKPT="${SEMANTIC1_DIR}/best_model.pt"
@@ -265,17 +278,22 @@ run_semantic2() {
     echo "Stage 1 checkpoint: ${S1_CKPT}"
 
     if [[ -n "${RESUME_FLAG}" ]]; then
-        LATEST_S2=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic2_"* 2>/dev/null | head -1 || echo "")
+        LATEST_S2=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic2_"* 2>/dev/null \
+            | xargs -I{} sh -c 'ls "{}"/checkpoint_latest.pt 2>/dev/null | head -1' \
+            | head -1 | xargs dirname 2>/dev/null || echo "")
         if [[ -n "${LATEST_S2}" ]]; then
             SEMANTIC2_DIR="${LATEST_S2}"
             echo "Resuming from: ${SEMANTIC2_DIR}"
         fi
     fi
 
+    mkdir -p "${SEMANTIC2_DIR}"
+
     COCO_ARG=""
     if [[ -d "${COCO_FMRI_DIR}" ]]; then
         COCO_ARG="--coco_fmri_dir ${COCO_FMRI_DIR}"
     fi
+
 
     # Stage 2: smaller batch, more accumulation steps to match paper's effective batch 64
     python "${BRAIN_IT_DIR}/train_semantic.py" \
@@ -291,6 +309,7 @@ run_semantic2() {
         --grad_accum_steps 8 \
         --voxels_per_image 15000 \
         --lr 1e-5 \
+        --s2_warmup_epochs 1 \
         --use_amp \
         --num_workers 4 \
         --save_every 2 \
@@ -300,9 +319,26 @@ run_semantic2() {
         ${RESUME_FLAG} \
         "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" &
     PY_PID=$!
-    wait "${PY_PID}"
-}
+    wait "${PY_PID}" || true
+    TRAIN_EXIT=$?
 
+    # Only resubmit if the trainer exited with 75 (EX_TEMPFAIL) — interrupted
+    # by the Slurm time limit and a checkpoint was saved.  Exit 0 means
+    # training completed (or was already complete); no follow-up needed.
+    if [[ "${AUTO_RESUBMIT}" == "true" && "${TRAIN_EXIT}" -eq 75 ]]; then
+        NEXT_JOB=$(sbatch --parsable \
+            --export=ALL \
+            "${BASH_SOURCE[0]}" --phase semantic2 --resume --auto_resubmit \
+            "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" 2>/dev/null || echo "")
+        if [[ -n "${NEXT_JOB}" ]]; then
+            echo "[auto_resubmit] Training interrupted -- queued follow-up job ${NEXT_JOB}"
+        else
+            echo "[auto_resubmit] WARNING: failed to queue follow-up job"
+        fi
+    elif [[ "${AUTO_RESUBMIT}" == "true" && "${TRAIN_EXIT}" -eq 0 ]]; then
+        echo "[auto_resubmit] Training complete -- no follow-up job needed"
+    fi
+}
 # ---------------------------------------------------------------------------
 # Phase: Reconstruct test images
 # ---------------------------------------------------------------------------
@@ -319,12 +355,23 @@ run_reconstruct() {
 
     SEM_CKPT="${SEMANTIC2_DIR}/bit_latest.pt"
     if [[ ! -f "${SEM_CKPT}" ]]; then
-        # Fall back to stage 1 for testing without stage 2
-        LATEST_S1=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic1_"* 2>/dev/null | head -1 || echo "")
-        [[ -n "${LATEST_S1}" ]] && SEM_CKPT="${LATEST_S1}/best_model.pt"
+        # Find most recent semantic2 dir that has a checkpoint
+        LATEST_S2=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic2_"* 2>/dev/null \
+            | xargs -I{} sh -c 'ls "{}"/bit_latest.pt 2>/dev/null | head -1' \
+            | head -1 | xargs dirname 2>/dev/null || echo "")
+        if [[ -n "${LATEST_S2}" ]]; then
+            SEM_CKPT="${LATEST_S2}/bit_latest.pt"
+            SEMANTIC2_DIR="${LATEST_S2}"
+            echo "Using semantic2 checkpoint from: ${LATEST_S2}"
+        else
+            # Fall back to stage 1 if no stage 2 exists yet
+            LATEST_S1=$(ls -dt "${PROJECTDIR}/brain/checkpoints/bit_semantic1_"* 2>/dev/null | head -1 || echo "")
+            [[ -n "${LATEST_S1}" ]] && SEM_CKPT="${LATEST_S1}/best_model.pt"
+            echo "WARNING: No stage 2 checkpoint found — falling back to stage 1: ${SEM_CKPT}"
+        fi
     fi
 
-    UNET_CKPT="${SEMANTIC2_DIR}/unet_latest.pt"
+    UNET_CKPT="${SEMANTIC2_DIR}/unet_attn2_latest.pt"
     UNET_ARG=""
     [[ -f "${UNET_CKPT}" ]] && UNET_ARG="--unet_checkpoint ${UNET_CKPT}"
 
@@ -344,6 +391,10 @@ run_reconstruct() {
         --diffusion_steps 38 \
         --init_step 14 \
         --output_size 256 \
+        --wandb \
+        --wandb_project "${WANDB_PROJECT}" \
+        --wandb_group "${WANDB_RUN_GROUP}" \
+        --wandb_log_every "${WANDB_LOG_RECON_EVERY:-1}" \
         ${UNET_ARG} \
         "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" &
     PY_PID=$!

@@ -268,7 +268,8 @@ class VGGTargetExtractor(nn.Module):
         images: torch.Tensor,
         sample: bool = False,
         sample_counts: list[int] = VGG_TRAIN_SAMPLES,
-    ) -> list[torch.Tensor]:
+        return_indices: bool = False,
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]]:
         """
         Args:
             images:        (B, 3, H, W) in [0, 1]
@@ -276,13 +277,22 @@ class VGGTargetExtractor(nn.Module):
             sample_counts: tokens to sample per layer (only used if sample=True)
 
         Returns:
-            list of 5 token tensors (B, N_l, 512)
+            list of 5 token tensors (B, N_l, 512), plus sampled indices when
+            return_indices=True.
         """
         x = preprocess_for_vgg(images)
         feat_maps = self.vgg(x)
         tokens = vgg_maps_to_tokens(feat_maps)
         if sample:
-            tokens, _ = sample_tokens(tokens, sample_counts)
+            tokens, indices = sample_tokens(tokens, sample_counts)
+            if return_indices:
+                return tokens, indices
+        elif return_indices:
+            indices = [
+                torch.arange(tok.shape[1], device=tok.device)
+                for tok in tokens
+            ]
+            return tokens, indices
         return tokens
 
 

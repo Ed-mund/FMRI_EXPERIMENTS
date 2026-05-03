@@ -70,9 +70,12 @@ class NSDAlgonautsDataset(Dataset):
         │       ├── train-0000_nsd-00001.png
         │       └── ...
         └── test_split/
-            └── test_images/
-                ├── test-0000_nsd-00001.png
-                └── ...
+            ├── test_images/
+            │   ├── test-0000_nsd-00001.png
+            │   └── ...
+            └── test_fmri/               # available in Algonauts prepared data
+                ├── lh_test_fmri.npy     # (N_test, N_voxels_lh)
+                └── rh_test_fmri.npy     # (N_test, N_voxels_rh)
     """
 
     def __init__(
@@ -105,11 +108,19 @@ class NSDAlgonautsDataset(Dataset):
             self.fmri_data = np.concatenate([lh_fmri, rh_fmri], axis=1).astype(np.float32)
 
         elif split == "test":
-            # Test split typically doesn't have fMRI (for the challenge)
-            # But for our encoder evaluation, we need held-out fMRI
-            # You may need to create your own train/test split from training data
             self.image_dir = os.path.join(subj_dir, "test_split", "test_images")
-            self.fmri_data = None
+
+            # Load test fMRI when available (Algonauts prepared data includes it).
+            # This is the proper NSD shared-image evaluation set, matching the
+            # evaluation protocol used in Beliy et al. (2025).
+            lh_path = os.path.join(subj_dir, "test_split", "test_fmri", "lh_test_fmri.npy")
+            rh_path = os.path.join(subj_dir, "test_split", "test_fmri", "rh_test_fmri.npy")
+            if os.path.isfile(lh_path) and os.path.isfile(rh_path):
+                lh_fmri = np.load(lh_path)
+                rh_fmri = np.load(rh_path)
+                self.fmri_data = np.concatenate([lh_fmri, rh_fmri], axis=1).astype(np.float32)
+            else:
+                self.fmri_data = None
 
         # Get sorted image file list
         self.image_files = sorted([

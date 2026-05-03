@@ -1,52 +1,18 @@
-# Python
+# Runtime/generated outputs
+.logs/
+wandb/
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Checkpoints & model weights
-checkpoints/
 *.pt
 *.pth
 *.ckpt
-*.safetensors
-best_model.pt
+checkpoints/
+brain_it/reconstructions/
+brain_it/results/
+brain_it/v2c/*.pkl
+brain_it/v2c/*.pt
+brain_it/v2c/*.npy
 
-# Large data arrays
-*.npy
-*.npz
-*.pkl
-*.h5
-*.hdf5
-
-# Wandb
-wandb/
-
-# Logs
-*.log
-.logs/
-
-# Cache
+# Local caches
 .cache/
 triton_cache/
-*.bak
-
-# PDFs / papers (store separately)
-*.pdf
-
-# SLURM output (if run locally)
-slurm-*.out
-slurm-*.err
-
-# OS
-.DS_Store
-*.swp
-*~

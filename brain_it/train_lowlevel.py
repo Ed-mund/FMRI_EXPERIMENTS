@@ -258,24 +258,27 @@ def _per_layer_infonce(
     criterion: InfoNCELoss,
     preds: list[torch.Tensor],
     targets: list[torch.Tensor],
+    target_indices: list[torch.Tensor] | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, list[float]]:
     """
     Compute InfoNCE per VGG layer; return total loss + per-layer values.
 
-    Predictions have full token counts (e.g. 3136, 3025, ...) and layer channel dims
-    (64, 128, 256, 512, 512). Targets are sampled (512, 512, 128, 64, 16) and 512-dim.
-    We sample preds to match target token count and slice target to pred channel dim.
+    Predictions have full token counts (e.g. 3136, 3025, ...) and layer channel
+    dims (64, 128, 256, 512, 512). Targets are sampled from the same full VGG
+    grids, so predictions must be gathered at the exact sampled token indices.
     """
     layer_losses = []
-    for pred, tgt in zip(preds, targets):
+    for layer_idx, (pred, tgt) in enumerate(zip(preds, targets)):
         B, N_pred, D_pred = pred.shape
         _, N_tgt, D_tgt = tgt.shape
         N_use = min(N_pred, N_tgt)
         D_use = min(D_pred, D_tgt)
 
-        # Sample N_use token positions from predictions (random during training)
-        if N_pred > N_use:
+        if target_indices is not None:
+            idx = target_indices[layer_idx].to(device=pred.device)[:N_use]
+            pred_use = pred.index_select(dim=1, index=idx)
+        elif N_pred > N_use:
             idx = torch.randperm(N_pred, device=pred.device, generator=generator)[:N_use]
             pred_use = pred[:, idx, :]  # (B, N_use, D_pred)
         else:
@@ -340,7 +343,12 @@ def train_epoch(
 
         # VGG targets (frozen)
         with torch.no_grad():
-            vgg_targets = vgg_extractor(images, sample=True, sample_counts=VGG_TRAIN_SAMPLES)
+            vgg_targets, vgg_indices = vgg_extractor(
+                images,
+                sample=True,
+                sample_counts=VGG_TRAIN_SAMPLES,
+                return_indices=True,
+            )
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -362,7 +370,7 @@ def train_epoch(
 
             with autocast("cuda", dtype=torch.bfloat16, enabled=args.use_amp):
                 preds = model(fmri_s, vox_s, clust_s, subj)
-                loss, layer_vals = _per_layer_infonce(criterion, preds, vgg_t)
+                loss, layer_vals = _per_layer_infonce(criterion, preds, vgg_t, vgg_indices)
 
             if args.use_amp:
                 scaler.scale(loss).backward()
@@ -466,7 +474,12 @@ def validate(
         cluster_assignments = batch["cluster_assignments"].to(device, non_blocking=True)
         subject_ids = batch["subject_ids"]
 
-        vgg_targets = vgg_extractor(images, sample=True, sample_counts=VGG_TRAIN_SAMPLES)
+        vgg_targets, vgg_indices = vgg_extractor(
+            images,
+            sample=True,
+            sample_counts=VGG_TRAIN_SAMPLES,
+            return_indices=True,
+        )
 
         unique_subjects = list(dict.fromkeys(subject_ids))
         for subj in unique_subjects:
@@ -483,7 +496,7 @@ def validate(
 
             with autocast("cuda", dtype=torch.bfloat16, enabled=args.use_amp):
                 preds = model(fmri_s, vox_s, clust_s, subj)
-                loss, layer_vals = _per_layer_infonce(criterion, preds, vgg_t)
+                loss, layer_vals = _per_layer_infonce(criterion, preds, vgg_t, vgg_indices)
 
             total_loss += loss.item()
             n_batches += 1
@@ -627,7 +640,7 @@ def main(args: argparse.Namespace):
         start_epoch, best_val_loss, history = load_checkpoint(
             latest_ckpt, model, optimizer, scaler, device
         )
-        global_step = sum(len(loader) for _ in range(start_epoch))
+        global_step = start_epoch * len(train_loader)
     elif args.resume:
         log.info("--resume specified but no checkpoint found. Starting fresh.")
 
